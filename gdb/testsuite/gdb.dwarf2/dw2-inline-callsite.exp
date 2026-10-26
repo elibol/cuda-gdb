@@ -183,5 +183,71 @@ foreach mode {instances ranges explicit-entry} {
 	gdb_test "break $srcfile3:17" \
 	    "Note: breakpoint $decimal also set at pc $hex.*line 19\\." \
 	    "eliminated call uses existing next-line fallback"
+
+	# A JIT can add another compiled instance after the breakpoint has
+	# already resolved.  Model successive module loads with two DSOs,
+	# keeping the first loaded while the second acquires new locations.
+	if {$mode == "instances" && [allow_shlib_tests]} {
+	    with_test_prefix "successive module loads" {
+		set libraries {}
+		set failed 0
+		foreach instance {1 2} {
+		    set library [standard_output_file "$testfile-$instance.so"]
+		    if {[gdb_compile_shlib \
+			     [list "$srcdir/$subdir/$srcfile" $asm_file] \
+			     $library $build_options] != ""} {
+			set failed 1
+			break
+		    }
+		    lappend libraries $library
+		}
+		set loader [standard_output_file "$testfile-loader"]
+		if {$failed || [gdb_compile \
+			"$srcdir/$subdir/dw2-inline-callsite-dlopen.c" \
+			$loader executable {debug shlib_load}] != ""} {
+		    untested "build module loader"
+		    continue
+		}
+		clean_restart $loader
+		foreach library $libraries {
+		    gdb_load_shlib $library
+		}
+		gdb_test_no_output "set args [join $libraries { }]" "set module arguments"
+		gdb_test_no_output "set breakpoint pending on"
+		gdb_test "break $srcfile3:18" \
+		    "Breakpoint $decimal .*pending\\." "set pending call-site breakpoint"
+		gdb_run_cmd
+		gdb_test "" "Breakpoint .*" "resolve first loaded instance"
+		foreach instance {1 2} {
+		    with_test_prefix "module $instance" {
+			if {$instance == 2} {
+			    gdb_test "continue" "Breakpoint .*" \
+				"resolve newly loaded instance"
+			}
+			if {$instance == 1} {
+			    set first_pc [get_hexadecimal_valueof "\$pc" 0]
+			    gdb_test "print \$pc == (void *) &line_label_2" " = 1" \
+				"stop before first inline instance"
+			} else {
+			    gdb_test "print \$pc != $first_pc" " = 1" \
+				"new module has its own breakpoint address"
+			}
+			gdb_test "backtrace" \
+			    "#0 .*nested.*#1 .*callee.*#2 .*main.*" \
+			    "preserve newly loaded inline chain"
+			gdb_test "continue" "Breakpoint .*" \
+			    "hit second inline instance"
+			# PCs must be resolved in the current DSO, not whichever
+			# object owns the first global symbol with the same name.
+			gdb_test "info line *\$pc" ".*$srcfile4.*line 22.*|Line 22 of .*$srcfile4.*" \
+			    "stop at the helper entry in this module"
+		    }
+		}
+		gdb_test "info breakpoints" \
+		    "MULTIPLE.*$decimal\\.1.*$decimal\\.2.*$decimal\\.3.*$decimal\\.4.*" \
+		    "both loaded modules retain both inline instances"
+		gdb_test "continue" ".*exited normally.*" "unload modules and exit"
+	    }
+	}
     }
 }
